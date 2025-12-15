@@ -11,6 +11,10 @@ import sys
 import json
 import logging
 from typing import Any, Optional
+import time
+import requests
+import datetime
+import arxiv
 from dotenv import load_dotenv
 from pyzotero import zotero
 from mcp.server.fastmcp import FastMCP
@@ -216,8 +220,14 @@ def add_item(
 
     # Add to collection if specified
     if collection_key and response.get("success"):
-        item_key = response["successful"]["0"]["key"]
-        zot.addto_collection(collection_key, [item_key])
+        # Fix: handle explicit list or dict key depending on Pyzotero version
+        try:
+            item_data = response["successful"][0]
+        except (KeyError, TypeError, IndexError):
+             # Fallback if it is a dict with string key "0"
+            item_data = response["successful"]["0"]
+            
+        zot.addto_collection(collection_key, item_data)
 
     return json.dumps(response, indent=2)
 
@@ -340,6 +350,135 @@ def get_item_fields(item_type: str) -> str:
     ensure_client()
     fields = zot.item_type_fields(item_type)
     return json.dumps(fields, indent=2)
+
+
+@mcp.tool()
+def upload_attachment(item_key: str, file_path: str) -> str:
+    """
+    Upload a file attachment to a Zotero item.
+
+    Args:
+        item_key: The parent Zotero item key
+        file_path: Absolute path to the file to upload
+
+    Returns:
+        JSON string with upload result
+    """
+    ensure_client()
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    # simple attachment upload
+    # returns checking result or identification of successful upload
+    try:
+        result = zot.attachment_simple([file_path], item_key)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error uploading attachment: {str(e)}")
+        raise RuntimeError(f"Upload failed: {str(e)}")
+
+
+@mcp.tool()
+def ingest_arxiv_paper(arxiv_id: str, collection_key: Optional[str] = None) -> str:
+    """
+    Robustly ingest an ArXiv paper into Zotero with full metadata and PDF.
+
+    Args:
+        arxiv_id: The ArXiv ID (e.g., '2101.12345')
+        collection_key: Optional Zotero collection to add to
+
+    Returns:
+        JSON string with result details
+    """
+    ensure_client()
+    
+    # 1. Fetch from ArXiv
+    logger.info(f"Fetching metadata for ArXiv ID: {arxiv_id}")
+    try:
+        search = arxiv.Search(id_list=[arxiv_id])
+        paper = next(search.results())
+    except Exception as e:
+        return json.dumps({"error": f"ArXiv fetch failed: {str(e)}"}, indent=2)
+
+    # 2. Map Metadata
+    creators = [{"creatorType": "author", "firstName": a.name.split(" ")[0], "lastName": " ".join(a.name.split(" ")[1:])} for a in paper.authors]
+    
+    # Format "Extra" field for AI agents
+    ingest_time = datetime.datetime.now().isoformat()
+    extra_metadata = (
+        f"ArXiv_ID: {arxiv_id}\n"
+        f"AI_Ready: true\n"
+        f"Ingested_Date: {ingest_time}\n"
+        f"Categories: {', '.join(paper.categories)}\n"
+        f"ArXiv_URL: {paper.entry_id}\n"
+        f"PDF_URL: {paper.pdf_url}"
+    )
+
+    item_template = zot.item_template('journalArticle')
+    item_template['title'] = paper.title
+    item_template['creators'] = creators
+    item_template['abstractNote'] = paper.summary
+    item_template['date'] = paper.published.strftime("%Y-%m-%d")
+    item_template['url'] = paper.entry_id
+    item_template['DOI'] = paper.doi if paper.doi else ""
+    item_template['extra'] = extra_metadata
+
+    # 3. Create Item
+    logger.info("Creating Zotero item...")
+    try:
+        response = zot.create_items([item_template])
+        if response.get('successful'):
+            # Handle list vs dict response quirk
+            try:
+                item_data = response['successful'][0]
+            except (KeyError, TypeError, IndexError):
+                item_data = response['successful']['0']
+            
+            item_key = item_data['key']
+            
+            if collection_key:
+                zot.addto_collection(collection_key, item_data)
+        else:
+            return json.dumps({"error": "Failed to create Zotero item", "details": response}, indent=2)
+    except Exception as e:
+         return json.dumps({"error": f"Zotero creation failed: {str(e)}"}, indent=2)
+
+    # 4. Download and Attach PDF
+    logger.info("Downloading PDF...")
+    pdf_path = f"/tmp/{arxiv_id}.pdf"
+    try:
+        # Use a custom user agent to avoid bot blocking
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'}
+        response = requests.get(paper.pdf_url, headers=headers)
+        response.raise_for_status()
+        
+        with open(pdf_path, 'wb') as f:
+            f.write(response.content)
+            
+        logger.info(f"Attaching PDF to item {item_key}...")
+        zot.attachment_simple([pdf_path], item_key)
+        
+    except Exception as e:
+        logger.error(f"PDF download/upload failed: {str(e)}")
+        # We don't fail the whole tool if just PDF fails, but we note it
+        return json.dumps({
+            "success": True, 
+            "item_key": item_key, 
+            "message": "Item created but PDF upload failed",
+            "error_details": str(e)
+        }, indent=2)
+    finally:
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+
+    return json.dumps({
+        "success": True,
+        "item_key": item_key,
+        "title": paper.title,
+        "arxiv_id": arxiv_id,
+        "message": "Paper ingested and PDF attached successfully"
+    }, indent=2)
 
 
 def main():
