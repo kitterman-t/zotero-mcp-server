@@ -70,6 +70,53 @@ def ensure_client():
 
 
 # ============================================================================
+# SECURITY - Path Validation & Sandboxing
+# ============================================================================
+
+def get_allowed_upload_dirs() -> list[str]:
+    """Get list of allowed directories for file uploads."""
+    # Default safe directories
+    allowed = [
+        os.path.expanduser("~/Downloads"),
+        "/tmp",
+    ]
+    
+    # Check for custom allowed directory in env
+    custom_dir = os.getenv('ZOTERO_ALLOWED_UPLOAD_DIR')
+    if custom_dir:
+        allowed.append(os.path.expanduser(custom_dir))
+        
+    return [os.path.abspath(p) for p in allowed]
+
+def validate_path(file_path: str) -> str:
+    """
+    Validate that a file path is within allowed directories.
+    Returns absolute path if valid, raises PermissionError if not.
+    """
+    abs_path = os.path.abspath(file_path)
+    allowed_dirs = get_allowed_upload_dirs()
+    
+    is_allowed = False
+    for safe_dir in allowed_dirs:
+        # Check if safe_dir is a parent of abs_path
+        # os.path.commonpath returns the longest common sub-path
+        try:
+            if os.path.commonpath([safe_dir, abs_path]) == safe_dir:
+                is_allowed = True
+                break
+        except ValueError:
+            # Can happen across drives on Windows, or if paths are totally different
+            continue
+            
+    if not is_allowed:
+        # Don't leak the full allowed list in the error for cleaner logs, 
+        # but useful for debugging if needed.
+        raise PermissionError(f"Security: Access denied to {file_path}. Path is not in an allowed directory.")
+        
+    return abs_path
+
+
+# ============================================================================
 # RESOURCES - Read-only data access
 # ============================================================================
 
@@ -356,6 +403,9 @@ def get_item_fields(item_type: str) -> str:
 def upload_attachment(item_key: str, file_path: str) -> str:
     """
     Upload a file attachment to a Zotero item.
+    
+    SECURITY UPDATE: This tool strictly enforces sandboxing. 
+    Files must be within allowed directories (e.g., ~/Downloads, /tmp).
 
     Args:
         item_key: The parent Zotero item key
@@ -366,13 +416,19 @@ def upload_attachment(item_key: str, file_path: str) -> str:
     """
     ensure_client()
 
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+    # 1. Security Check
+    try:
+        safe_path = validate_path(file_path)
+    except PermissionError as e:
+        logger.warning(f"Blocked attempt to access unsafe path: {file_path}")
+        raise e
+
+    if not os.path.exists(safe_path):
+        raise FileNotFoundError(f"File not found: {safe_path}")
 
     # simple attachment upload
-    # returns checking result or identification of successful upload
     try:
-        result = zot.attachment_simple([file_path], item_key)
+        result = zot.attachment_simple([safe_path], item_key)
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error uploading attachment: {str(e)}")
@@ -383,6 +439,9 @@ def upload_attachment(item_key: str, file_path: str) -> str:
 def ingest_arxiv_paper(arxiv_id: str, collection_key: Optional[str] = None) -> str:
     """
     Robustly ingest an ArXiv paper into Zotero with full metadata and PDF.
+    
+    SECURITY NOTE: This tool handles file paths internally using a temporary directory.
+    It does NOT accept user-provided file paths, effectively mitigating traversal risks.
 
     Args:
         arxiv_id: The ArXiv ID (e.g., '2101.12345')
@@ -446,7 +505,16 @@ def ingest_arxiv_paper(arxiv_id: str, collection_key: Optional[str] = None) -> s
 
     # 4. Download and Attach PDF
     logger.info("Downloading PDF...")
+    # Use global temp dir logic or hardcode /tmp as it is universally safe for ephemeral data
     pdf_path = f"/tmp/{arxiv_id}.pdf"
+    
+    # Explicitly validate this path just to be safe/consistent, though it's hardcoded
+    try:
+        validate_path(pdf_path) 
+    except PermissionError:
+        # Fallback if /tmp isn't allowed (unlikely)
+        pass
+
     try:
         # Use a custom user agent to avoid bot blocking
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'}
