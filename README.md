@@ -103,6 +103,8 @@ The Zotero MCP server can be integrated with AI applications that support the Mo
 - `delete_item`: Delete an item from the Zotero library
 - `get_item_types`: Get list of all available Zotero item types
 - `get_item_fields`: Get available fields for a specific item type
+- `upload_attachment`: Upload a file attachment to a Zotero item (Sandboxed)
+- `ingest_arxiv_paper`: Robustly ingest an ArXiv paper with metadata and PDF
 
 ## Documentation
 
