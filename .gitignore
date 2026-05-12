@@ -41,3 +41,6 @@ ENV/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Local one-off scripts (personal sync work, not part of the MCP server)
+scripts/
