@@ -17,7 +17,7 @@ This guide provides detailed instructions on how to set up, run, and use the Zot
 
 Before using the Zotero MCP server, you need:
 
-- Python 3.7 or higher
+- Python 3.10 or higher
 - A Zotero account
 - A Zotero API key
 - Your Zotero user ID or group ID
@@ -26,7 +26,7 @@ Before using the Zotero MCP server, you need:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/zotero-mcp-server.git
+   git clone https://github.com/kitterman-t/zotero-mcp-server.git
    cd zotero-mcp-server
    ```
 
