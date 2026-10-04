@@ -7,13 +7,13 @@ using the latest MCP paradigms and the official Python SDK.
 """
 
 import os
+import re
 import sys
 import json
 import logging
+import tempfile
 from typing import Any, Optional
-import time
 import requests
-import datetime
 import arxiv
 from dotenv import load_dotenv
 from pyzotero import zotero
@@ -73,47 +73,60 @@ def ensure_client():
 # SECURITY - Path Validation & Sandboxing
 # ============================================================================
 
+DEFAULT_UPLOAD_DIRS = ("~/Downloads", "/tmp")
+
+
 def get_allowed_upload_dirs() -> list[str]:
-    """Get list of allowed directories for file uploads."""
-    # Default safe directories
-    allowed = [
-        os.path.expanduser("~/Downloads"),
-        "/tmp",
-    ]
-    
-    # Check for custom allowed directory in env
+    """Directories upload_attachment may read from, with symlinks resolved."""
+    allowed = [os.path.expanduser(p) for p in DEFAULT_UPLOAD_DIRS]
+
     custom_dir = os.getenv('ZOTERO_ALLOWED_UPLOAD_DIR')
     if custom_dir:
         allowed.append(os.path.expanduser(custom_dir))
-        
-    return [os.path.abspath(p) for p in allowed]
+
+    # realpath, not abspath: on macOS /tmp is itself a link to /private/tmp,
+    # and both sides of the comparison must be resolved the same way.
+    return [os.path.realpath(p) for p in allowed]
+
 
 def validate_path(file_path: str) -> str:
     """
-    Validate that a file path is within allowed directories.
-    Returns absolute path if valid, raises PermissionError if not.
+    Return the resolved path of file_path if it lies inside an allowed directory.
+
+    Symlinks are resolved before the check, so a link placed inside ~/Downloads
+    that points at ~/.ssh is judged by where it points, not where it sits.
+    Raises PermissionError otherwise.
     """
-    abs_path = os.path.abspath(file_path)
-    allowed_dirs = get_allowed_upload_dirs()
-    
-    is_allowed = False
-    for safe_dir in allowed_dirs:
-        # Check if safe_dir is a parent of abs_path
-        # os.path.commonpath returns the longest common sub-path
+    real_path = os.path.realpath(os.path.expanduser(file_path))
+
+    for safe_dir in get_allowed_upload_dirs():
         try:
-            if os.path.commonpath([safe_dir, abs_path]) == safe_dir:
-                is_allowed = True
-                break
+            if os.path.commonpath([safe_dir, real_path]) == safe_dir:
+                return real_path
         except ValueError:
-            # Can happen across drives on Windows, or if paths are totally different
+            # Different drives on Windows have no common path.
             continue
-            
-    if not is_allowed:
-        # Don't leak the full allowed list in the error for cleaner logs, 
-        # but useful for debugging if needed.
-        raise PermissionError(f"Security: Access denied to {file_path}. Path is not in an allowed directory.")
-        
-    return abs_path
+
+    raise PermissionError(
+        f"Access denied to {file_path}: it is not inside an allowed upload "
+        "directory (~/Downloads, /tmp, or ZOTERO_ALLOWED_UPLOAD_DIR)."
+    )
+
+
+def first_created_item(response: dict[str, Any]) -> dict[str, Any]:
+    """Return the first item from a create_items response.
+
+    The Zotero API keys "successful" by the item's position as a string
+    ("0"), but some pyzotero versions have returned a list, so accept both.
+    """
+    successful = response.get("successful") or {}
+    if isinstance(successful, dict):
+        item = successful.get("0")
+    else:
+        item = successful[0] if successful else None
+    if not item:
+        raise RuntimeError(f"Zotero did not create the item: {json.dumps(response)}")
+    return item
 
 
 # ============================================================================
@@ -267,14 +280,9 @@ def add_item(
 
     # Add to collection if specified
     if collection_key and response.get("success"):
-        # Fix: handle explicit list or dict key depending on Pyzotero version
-        try:
-            item_data = response["successful"][0]
-        except (KeyError, TypeError, IndexError):
-             # Fallback if it is a dict with string key "0"
-            item_data = response["successful"]["0"]
-            
-        zot.addto_collection(collection_key, item_data)
+        # addto_collection needs the created item dict (key, version and data),
+        # not a list of keys.
+        zot.addto_collection(collection_key, first_created_item(response))
 
     return json.dumps(response, indent=2)
 
@@ -402,151 +410,201 @@ def get_item_fields(item_type: str) -> str:
 @mcp.tool()
 def upload_attachment(item_key: str, file_path: str) -> str:
     """
-    Upload a file attachment to a Zotero item.
-    
-    SECURITY UPDATE: This tool strictly enforces sandboxing. 
-    Files must be within allowed directories (e.g., ~/Downloads, /tmp).
+    Upload a file as an attachment to an existing Zotero item.
+
+    Only files inside ~/Downloads, /tmp, or the directory named by
+    ZOTERO_ALLOWED_UPLOAD_DIR can be uploaded, so a model cannot be talked
+    into sending arbitrary local files to the Zotero cloud.
 
     Args:
         item_key: The parent Zotero item key
-        file_path: Absolute path to the file to upload
+        file_path: Path to the file to upload
 
     Returns:
-        JSON string with upload result
+        JSON string with the upload result
     """
     ensure_client()
 
-    # 1. Security Check
     try:
         safe_path = validate_path(file_path)
-    except PermissionError as e:
-        logger.warning(f"Blocked attempt to access unsafe path: {file_path}")
-        raise e
+    except PermissionError:
+        logger.warning(f"Blocked upload from outside the allowed directories: {file_path}")
+        raise
 
-    if not os.path.exists(safe_path):
-        raise FileNotFoundError(f"File not found: {safe_path}")
+    if not os.path.isfile(safe_path):
+        raise FileNotFoundError(f"Not a file: {file_path}")
 
-    # simple attachment upload
-    try:
-        result = zot.attachment_simple([safe_path], item_key)
-        return json.dumps(result, indent=2)
-    except Exception as e:
-        logger.error(f"Error uploading attachment: {str(e)}")
-        raise RuntimeError(f"Upload failed: {str(e)}")
+    result = zot.attachment_simple([safe_path], item_key)
+    return json.dumps(result, indent=2)
+
+
+# New-style IDs (2101.12345, optional version) and old-style IDs, which carry
+# an archive name and a slash (hep-th/9901001).
+ARXIV_ID_RE = re.compile(
+    r"^(?:\d{4}\.\d{4,5}|[a-z][a-z\-]*(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?$"
+)
+
+# arXiv asks automated clients to identify themselves rather than pose as a
+# browser.
+USER_AGENT = "zotero-mcp-server (+https://github.com/kitterman-t/zotero-mcp-server)"
+
+# A cap on the PDF download, enforced while streaming, so a bad response
+# cannot fill the disk before the size is known.
+MAX_PDF_BYTES = 100 * 1024 * 1024
+
+
+def normalize_arxiv_id(raw: str) -> str:
+    """Accept an arXiv ID, an "arXiv:" prefixed ID, or an abs/pdf URL."""
+    value = raw.strip()
+    value = re.sub(r"^arxiv:", "", value, flags=re.IGNORECASE)
+    match = re.match(r"^https?://(?:www\.|export\.)?arxiv\.org/(?:abs|pdf)/(.+?)(?:\.pdf)?/?$", value)
+    if match:
+        value = match.group(1)
+    if not ARXIV_ID_RE.match(value):
+        raise ValueError(f"Not an arXiv ID: {raw!r}")
+    return value
+
+
+def arxiv_creators(authors: list[Any]) -> list[dict[str, str]]:
+    """Map arXiv author names to Zotero creators.
+
+    arXiv gives one display name per author. The last word becomes the last
+    name, so "John A. Smith" is Smith, John A.; a one-word name uses Zotero's
+    single-field form instead of leaving the last name empty.
+    """
+    creators = []
+    for author in authors:
+        first, _, last = author.name.strip().rpartition(" ")
+        if first:
+            creators.append({"creatorType": "author", "firstName": first, "lastName": last})
+        else:
+            creators.append({"creatorType": "author", "name": last})
+    return creators
+
+
+def find_existing_arxiv_item(arxiv_id: str) -> Optional[dict[str, Any]]:
+    """Return a library item that already holds this paper, in any version."""
+    base_id = re.sub(r"v\d+$", "", arxiv_id)
+    for item in zot.items(q=base_id, qmode="everything", limit=25):
+        data = item.get("data", {})
+        archive_id = re.sub(r"v\d+$", "", data.get("archiveID", ""))
+        url = data.get("url", "")
+        if archive_id == f"arXiv:{base_id}" or re.search(
+            rf"arxiv\.org/(?:abs|pdf)/{re.escape(base_id)}(?:v\d+)?(?:\.pdf)?$", url
+        ):
+            return item
+    return None
+
+
+def download_pdf(url: str, dest: str) -> None:
+    """Stream a PDF to dest, refusing anything over MAX_PDF_BYTES or not a PDF."""
+    with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=(10, 60), stream=True) as response:
+        response.raise_for_status()
+        received = 0
+        with open(dest, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                received += len(chunk)
+                if received > MAX_PDF_BYTES:
+                    raise ValueError(f"PDF is larger than {MAX_PDF_BYTES // (1024 * 1024)} MB")
+                handle.write(chunk)
+    with open(dest, "rb") as handle:
+        if handle.read(5) != b"%PDF-":
+            raise ValueError("Download is not a PDF")
 
 
 @mcp.tool()
-def ingest_arxiv_paper(arxiv_id: str, collection_key: Optional[str] = None) -> str:
+def ingest_arxiv_paper(
+    arxiv_id: str,
+    collection_key: Optional[str] = None,
+    allow_duplicate: bool = False,
+) -> str:
     """
-    Robustly ingest an ArXiv paper into Zotero with full metadata and PDF.
-    
-    SECURITY NOTE: This tool handles file paths internally using a temporary directory.
-    It does NOT accept user-provided file paths, effectively mitigating traversal risks.
+    Add an arXiv paper to Zotero as a preprint, with its metadata and PDF.
+
+    If the library already holds the paper (any version), nothing is created
+    and the existing item key is returned, unless allow_duplicate is true.
 
     Args:
-        arxiv_id: The ArXiv ID (e.g., '2101.12345')
-        collection_key: Optional Zotero collection to add to
+        arxiv_id: An arXiv ID (2101.12345, 2101.12345v2, hep-th/9901001),
+            optionally prefixed with "arXiv:", or an arxiv.org abs/pdf URL
+        collection_key: Optional Zotero collection to add the item to
+        allow_duplicate: Create a new item even if the paper is already there
 
     Returns:
-        JSON string with result details
+        JSON string with the item key and whether the PDF was attached
     """
     ensure_client()
-    
-    # 1. Fetch from ArXiv
-    logger.info(f"Fetching metadata for ArXiv ID: {arxiv_id}")
-    try:
-        search = arxiv.Search(id_list=[arxiv_id])
-        paper = next(search.results())
-    except Exception as e:
-        return json.dumps({"error": f"ArXiv fetch failed: {str(e)}"}, indent=2)
 
-    # 2. Map Metadata
-    creators = [{"creatorType": "author", "firstName": a.name.split(" ")[0], "lastName": " ".join(a.name.split(" ")[1:])} for a in paper.authors]
-    
-    # Format "Extra" field for AI agents
-    ingest_time = datetime.datetime.now().isoformat()
-    extra_metadata = (
-        f"ArXiv_ID: {arxiv_id}\n"
-        f"AI_Ready: true\n"
-        f"Ingested_Date: {ingest_time}\n"
-        f"Categories: {', '.join(paper.categories)}\n"
-        f"ArXiv_URL: {paper.entry_id}\n"
-        f"PDF_URL: {paper.pdf_url}"
-    )
+    arxiv_id = normalize_arxiv_id(arxiv_id)
 
-    item_template = zot.item_template('journalArticle')
-    item_template['title'] = paper.title
-    item_template['creators'] = creators
-    item_template['abstractNote'] = paper.summary
-    item_template['date'] = paper.published.strftime("%Y-%m-%d")
-    item_template['url'] = paper.entry_id
-    item_template['DOI'] = paper.doi if paper.doi else ""
-    item_template['extra'] = extra_metadata
+    if not allow_duplicate:
+        existing = find_existing_arxiv_item(arxiv_id)
+        if existing:
+            return json.dumps({
+                "item_key": existing["key"],
+                "created": False,
+                "message": "This paper is already in the library",
+            }, indent=2)
 
-    # 3. Create Item
-    logger.info("Creating Zotero item...")
-    try:
-        response = zot.create_items([item_template])
-        if response.get('successful'):
-            # Handle list vs dict response quirk
-            try:
-                item_data = response['successful'][0]
-            except (KeyError, TypeError, IndexError):
-                item_data = response['successful']['0']
-            
-            item_key = item_data['key']
-            
-            if collection_key:
-                zot.addto_collection(collection_key, item_data)
-        else:
-            return json.dumps({"error": "Failed to create Zotero item", "details": response}, indent=2)
-    except Exception as e:
-         return json.dumps({"error": f"Zotero creation failed: {str(e)}"}, indent=2)
+    logger.info(f"Fetching arXiv metadata for {arxiv_id}")
+    client = arxiv.Client()
+    paper = next(client.results(arxiv.Search(id_list=[arxiv_id])), None)
+    if paper is None:
+        raise ValueError(f"arXiv has no paper with ID {arxiv_id}")
 
-    # 4. Download and Attach PDF
-    logger.info("Downloading PDF...")
-    # Use global temp dir logic or hardcode /tmp as it is universally safe for ephemeral data
-    pdf_path = f"/tmp/{arxiv_id}.pdf"
-    
-    # Explicitly validate this path just to be safe/consistent, though it's hardcoded
-    try:
-        validate_path(pdf_path) 
-    except PermissionError:
-        # Fallback if /tmp isn't allowed (unlikely)
-        pass
+    short_id = paper.get_short_id()
+    base_id = re.sub(r"v\d+$", "", short_id)
 
-    try:
-        # Use a custom user agent to avoid bot blocking
-        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'}
-        response = requests.get(paper.pdf_url, headers=headers)
-        response.raise_for_status()
-        
-        with open(pdf_path, 'wb') as f:
-            f.write(response.content)
-            
-        logger.info(f"Attaching PDF to item {item_key}...")
-        zot.attachment_simple([pdf_path], item_key)
-        
-    except Exception as e:
-        logger.error(f"PDF download/upload failed: {str(e)}")
-        # We don't fail the whole tool if just PDF fails, but we note it
-        return json.dumps({
-            "success": True, 
-            "item_key": item_key, 
-            "message": "Item created but PDF upload failed",
-            "error_details": str(e)
-        }, indent=2)
-    finally:
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
+    template = zot.item_template("preprint")
+    template["title"] = paper.title
+    template["creators"] = arxiv_creators(paper.authors)
+    template["abstractNote"] = paper.summary
+    template["date"] = paper.published.strftime("%Y-%m-%d")
+    template["url"] = paper.entry_id
+    template["repository"] = "arXiv"
+    template["archiveID"] = f"arXiv:{base_id}"
+    # arXiv registers a DataCite DOI for every paper; a journal DOI, when the
+    # paper was later published, belongs to that other version.
+    template["DOI"] = f"10.48550/arXiv.{base_id}"
+    extra = [f"arXiv categories: {', '.join(paper.categories)}"]
+    if paper.doi:
+        extra.append(f"Published version DOI: {paper.doi}")
+    if paper.journal_ref:
+        extra.append(f"Journal reference: {paper.journal_ref}")
+    template["extra"] = "\n".join(extra)
 
-    return json.dumps({
-        "success": True,
+    response = zot.create_items([template])
+    item = first_created_item(response)
+    item_key = item["key"]
+
+    if collection_key:
+        zot.addto_collection(collection_key, item)
+
+    result: dict[str, Any] = {
         "item_key": item_key,
+        "created": True,
         "title": paper.title,
-        "arxiv_id": arxiv_id,
-        "message": "Paper ingested and PDF attached successfully"
-    }, indent=2)
+        "arxiv_id": short_id,
+        "pdf_attached": False,
+    }
+
+    # The item exists at this point, so a failed PDF is reported in the
+    # result instead of raised, and the caller can retry the attachment.
+    if not paper.pdf_url:
+        result["pdf_error"] = "arXiv lists no PDF for this paper"
+        return json.dumps(result, indent=2)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="zotero-arxiv-") as tmp_dir:
+            pdf_path = os.path.join(tmp_dir, f"{base_id.replace('/', '_')}.pdf")
+            download_pdf(paper.pdf_url, pdf_path)
+            zot.attachment_simple([pdf_path], item_key)
+        result["pdf_attached"] = True
+    except Exception as e:
+        logger.error(f"PDF download or upload failed for {short_id}: {e}")
+        result["pdf_error"] = str(e)
+
+    return json.dumps(result, indent=2)
 
 
 def main():
