@@ -14,14 +14,14 @@ setup(
     description="A Model Context Protocol server for Zotero integration",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/your-username/zotero-mcp-server",
+    url="https://github.com/kitterman-t/zotero-mcp-server",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.10",
     install_requires=requirements,
     entry_points={
         "console_scripts": [
